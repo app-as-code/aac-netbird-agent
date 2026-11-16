@@ -1,0 +1,46 @@
+services:
+  # --- Main Application Service ---
+  aac-netbird-agent:
+    image: "netbirdio/netbird:0.74.2"
+    container_name: "aac-netbird-agent"
+    hostname: "netbird-agent"
+    restart: "unless-stopped"
+
+
+    environment:
+      NB_SETUP_KEY: "${NB_SETUP_KEY:?set NB_SETUP_KEY in .env (see .env.example)}"
+      NB_MANAGEMENT_URL: "https://netbird.example.com"
+      TZ: "Europe/Berlin"
+      NB_DISABLE_DNS: "true"
+      NB_DISABLE_CLIENT_ROUTES: "true"
+      NB_DISABLE_SERVER_ROUTES: "true"
+
+
+    volumes:
+      - "/export/docker/aac-netbird-agent/nb_client:/var/lib/netbird"
+
+    networks:
+      - interconnect
+      - stack_internal
+
+
+
+    cap_add:
+    - NET_ADMIN
+
+
+
+networks:
+  secured:
+    name: "services-secured"
+    external: true
+  exposed:
+    name: "services-exposed"
+    external: true
+  interconnect:
+    name: "docker-default"
+    external: true
+  stack_internal:
+    name: "aac-netbird-agent_stack_internal"
+    driver: "bridge"
+

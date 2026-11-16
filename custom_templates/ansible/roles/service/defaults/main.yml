@@ -1,0 +1,27 @@
+---
+# =============================================================================
+# aac-netbird-agent | role defaults  (native / ansible deploy)
+# -----------------------------------------------------------------------------
+# Copied VERBATIM by the engine. OVERRIDES the engine default
+# roles/service/defaults/main.yml, so service_state must be re-declared.
+# All per-deployment values (management URL, setup key, version) arrive at
+# RUNTIME from the SSoT context ({{ final_ssot_vars.vars.X }} /
+# {{ final_ssot_vars.secrets.X }}) — the values below are static mechanics only.
+# =============================================================================
+
+# Desired lifecycle state; overridden per host from hosts.yml services[].state
+# (present -> install.yml, absent -> uninstall.yml).
+service_state: present
+
+# Native install layout (matches the official installer + `netbird service`).
+netbird_binary: /usr/bin/netbird
+netbird_state_dir: /var/lib/netbird
+netbird_config_dir: /etc/netbird
+netbird_service_name: netbird
+# Registration marker: the flag record THIS ROLE writes after a successful
+# `netbird up` (see install.yml 4d). Not netbird's own config file: profile-
+# based clients (0.5x+) keep it in /var/lib/netbird/default.json, which the
+# daemon creates on first start BEFORE any login, so its presence proves
+# nothing — and the legacy config.json never exists, which made every run
+# re-register and churn the connection.
+netbird_registration_marker: /var/lib/netbird/.aac_up_flags

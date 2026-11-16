@@ -1,0 +1,55 @@
+---
+# =============================================================================
+# aac-netbird-agent | uninstall / teardown  (NetBird CLI, native)
+# -----------------------------------------------------------------------------
+# Best-effort and idempotent: disconnect, tear down the daemon service, remove
+# the package (apt) and/or the bin-installed binary, then purge state/config.
+# =============================================================================
+
+- name: "{{ final_ssot_vars.service.name }} | Check for an existing netbird binary"
+  ansible.builtin.command: "{{ netbird_binary }} version"
+  register: netbird_present
+  changed_when: false
+  failed_when: false
+
+- name: "{{ final_ssot_vars.service.name }} | Disconnect the mesh (netbird down)"
+  ansible.builtin.command: "{{ netbird_binary }} down"
+  register: netbird_down
+  changed_when: netbird_down.rc == 0
+  failed_when: false
+  when: netbird_present.rc == 0
+
+- name: "{{ final_ssot_vars.service.name }} | Stop + uninstall the netbird service"
+  ansible.builtin.command: "{{ netbird_binary }} service {{ item }}"
+  loop:
+    - stop
+    - uninstall
+  register: netbird_svc_teardown
+  changed_when: netbird_svc_teardown.rc == 0
+  failed_when: false
+  when: netbird_present.rc == 0
+
+# Package removal (apt path) — no-op/ignored when it was a bin install.
+- name: "{{ final_ssot_vars.service.name }} | Remove netbird apt packages (if package-installed)"
+  ansible.builtin.apt:
+    name:
+      - netbird
+      - netbird-ui
+    state: absent
+    purge: true
+  register: netbird_apt_remove
+  failed_when: false
+
+# Binary removal (bin install path).
+- name: "{{ final_ssot_vars.service.name }} | Remove the netbird binary (if bin-installed)"
+  ansible.builtin.file:
+    path: "{{ netbird_binary }}"
+    state: absent
+
+- name: "{{ final_ssot_vars.service.name }} | Purge netbird state + config"
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - "{{ netbird_state_dir }}"
+    - "{{ netbird_config_dir }}"

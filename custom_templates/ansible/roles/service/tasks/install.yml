@@ -1,0 +1,194 @@
+---
+# =============================================================================
+# aac-netbird-agent | install / converge  (NetBird CLI, native)
+# -----------------------------------------------------------------------------
+# Copied VERBATIM by the engine — every {{ ... }} is an Ansible RUNTIME
+# expression from the SSoT context (service / vars / secrets), never an
+# engine-time value. The setup key only ever appears as a runtime reference and
+# the task that passes it runs with no_log.
+#
+# Flow: derive pinned release from the SSoT image_tag -> run the official
+#       installer (bundled in files/) with the SSoT-derived attributes ->
+#       ensure the daemon runs -> `netbird up` (first-time registration only).
+# =============================================================================
+
+# --- PRE-FLIGHT: WireGuard capability -------------------------------------------
+# NetBird prefers a KERNEL WireGuard link (`ip link add … type wireguard`) and
+# only falls back to userspace wireguard-go — which needs /dev/net/tun — when it
+# can't create one. Unprivileged Proxmox LXC guests have no /dev/net/tun, but
+# kernel mode works fine there as long as the `wireguard` module is loaded on
+# the NODE (/etc/modules-load.d/wireguard.conf on the hypervisors). Probe the
+# same way NetBird does; without either path `netbird up` logs in fine (the
+# peer appears in the dashboard) but the interface can never come up, leaving a
+# half-configured, permanently offline peer. Skip such hosts loudly instead.
+- name: "{{ final_ssot_vars.service.name }} | Probe WireGuard capability (kernel link or tun device)"
+  ansible.builtin.shell:
+    cmd: |
+      if ip link add nbprobe0 type wireguard 2>/dev/null; then
+        ip link del nbprobe0; echo kernel; exit 0
+      fi
+      [ -c /dev/net/tun ] && { echo tun; exit 0; }
+      echo none
+  register: netbird_wg_probe
+  changed_when: false
+
+- name: "{{ final_ssot_vars.service.name }} | SKIP host: no WireGuard path available"
+  ansible.builtin.debug:
+    msg: >-
+      SKIPPING {{ inventory_hostname }} — neither a kernel WireGuard link can be
+      created nor does /dev/net/tun exist, so NetBird cannot bring up its
+      interface here. On a Proxmox LXC guest: load the `wireguard` module on the
+      hypervisor node (modprobe wireguard + /etc/modules-load.d/wireguard.conf);
+      alternatively pass /dev/net/tun through to the container. Then re-run.
+  when: (netbird_wg_probe.stdout | trim) == 'none'
+
+- name: "{{ final_ssot_vars.service.name }} | End play for this host (no WireGuard path)"
+  ansible.builtin.meta: end_host
+  when: (netbird_wg_probe.stdout | trim) == 'none'
+
+# --- 0. Derive the pinned release tag from the single SSoT version knob --------
+# service.image_tag ("0.74.2") drives BOTH the docker image and the native
+# install: NETBIRD_RELEASE wants a GitHub tag (v0.74.2). 'latest'/'' stays as-is.
+- name: "{{ final_ssot_vars.service.name }} | Derive NetBird release tag from image_tag"
+  ansible.builtin.set_fact:
+    netbird_release_tag: >-
+      {{ 'latest'
+         if ((final_ssot_vars.service.image_tag | default('latest')) in ['latest', ''])
+         else 'v' ~ (final_ssot_vars.service.image_tag | string | regex_replace('^v', '')) }}
+
+# --- 0b. docker -> native transition safety -----------------------------------
+# If this host previously ran the container (docker_compose) variant of this
+# service, tear that stack down first — otherwise the container registers as a
+# SECOND, separate netbird peer (named after the container, not the host).
+# Best-effort: no-op on hosts that never had the container.
+- name: "{{ final_ssot_vars.service.name }} | Remove a prior container-based netbird stack (docker -> native)"
+  ansible.builtin.shell:
+    cmd: |
+      set -e
+      dir="/export/docker/{{ final_ssot_vars.service.name }}"
+      if [ -f "$dir/docker-compose.yml" ]; then
+        docker compose -f "$dir/docker-compose.yml" down -v || true
+      fi
+      docker rm -f "{{ final_ssot_vars.service.name }}" 2>/dev/null || true
+  register: netbird_docker_cleanup
+  changed_when: "'Removing' in (netbird_docker_cleanup.stderr | default('')) or 'Stopping' in (netbird_docker_cleanup.stderr | default(''))"
+  failed_when: false
+
+# --- 1. Is netbird already installed? -----------------------------------------
+- name: "{{ final_ssot_vars.service.name }} | Check for an existing netbird binary"
+  ansible.builtin.command: "{{ netbird_binary }} version"
+  register: netbird_installed
+  changed_when: false
+  failed_when: false
+
+# --- 2. Install via the official installer, with SSoT-derived attributes -------
+# USE_BIN_INSTALL=true + NETBIRD_RELEASE pin the exact release (apt would install
+# 'latest'); SKIP_UI_APP keeps it headless. The installer also runs
+# `netbird service install/start`, so the daemon is up afterwards.
+- name: "{{ final_ssot_vars.service.name }} | Install NetBird {{ netbird_release_tag }} (official installer, pinned)"
+  ansible.builtin.script: files/netbird-install.sh
+  environment:
+    NETBIRD_RELEASE: "{{ netbird_release_tag }}"
+    SKIP_UI_APP: "{{ final_ssot_vars.vars.NB_SKIP_UI_APP | default('true') }}"
+    USE_BIN_INSTALL: "{{ final_ssot_vars.vars.NB_USE_BIN_INSTALL | default('true') }}"
+  when: netbird_installed.rc != 0
+  register: netbird_install
+  changed_when: netbird_install.rc == 0
+
+# --- 3. Ensure the daemon service is enabled + running -------------------------
+- name: "{{ final_ssot_vars.service.name }} | Ensure the netbird daemon is enabled and started"
+  ansible.builtin.systemd_service:
+    name: "{{ netbird_service_name }}"
+    enabled: true
+    state: started
+    daemon_reload: true
+  register: netbird_svc
+  failed_when: false
+
+# --- 4. First-time registration -----------------------------------------------
+# {{ netbird_registration_marker }} is the flag record this role writes after a
+# successful `up` (step 4d) — its absence means this role never brought the peer
+# up here, so the setup key is passed. On subsequent runs the daemon reconnects
+# on its own and we only touch the connection when the flag set changed.
+- name: "{{ final_ssot_vars.service.name }} | Check whether this peer is already registered"
+  ansible.builtin.stat:
+    path: "{{ netbird_registration_marker }}"
+  register: netbird_registered
+
+- name: "{{ final_ssot_vars.service.name }} | Assert a setup key is provided before first registration"
+  ansible.builtin.assert:
+    that:
+      - (final_ssot_vars.secrets.NB_SETUP_KEY | default('')) | length > 0
+      - (final_ssot_vars.secrets.NB_SETUP_KEY | default('')) != 'CHANGE_ME'
+    fail_msg: >-
+      NB_SETUP_KEY is unset. Generate a setup key in the NetBird dashboard and
+      set it per host in iac-controller (hosts.yml -> services[].config.secrets).
+  when: not netbird_registered.stat.exists
+
+# --- 4a. Assemble the desired runtime flag set (single source of truth) --------
+# Minimal-footprint by default (see service.yml vars): the peer registers and is
+# reachable in the mesh, but does NOT manage DNS or routes. Each knob is a plain
+# boolean gate; disabling a capability appends the matching `netbird up` flag.
+# The same string is used for first registration AND for reconciling an already-
+# registered peer, so both paths always converge on the identical settings.
+- name: "{{ final_ssot_vars.service.name }} | Assemble desired `netbird up` runtime flags"
+  ansible.builtin.set_fact:
+    # Built with the `~` string-concat operator (never list arithmetic) so it is
+    # robust under Ansible's native-Jinja evaluation. Each present flag carries a
+    # trailing space; empty groups contribute nothing; the final `| trim` drops
+    # the trailing/only whitespace.
+    netbird_up_flags: >-
+      {{ (
+           ('--disable-dns ' if not (final_ssot_vars.vars.NB_MANAGE_DNS | default('false') | bool) else '')
+         ~ ('--disable-client-routes ' if not (final_ssot_vars.vars.NB_CLIENT_ROUTES | default('false') | bool) else '')
+         ~ ('--disable-server-routes ' if not (final_ssot_vars.vars.NB_SERVER_ROUTES | default('false') | bool) else '')
+         ~ ('--allow-server-ssh --enable-ssh-root' if (final_ssot_vars.vars.NB_ENABLE_SSH | default('true') | bool) else '')
+         ) | trim }}
+
+# --- 4b. Read the flag set last applied by this role (idempotency marker) -------
+# We record the desired flag string after every successful `up`. On the next run
+# we only re-run `up` if the desired flags changed — so converge is idempotent
+# and doesn't churn the connection on every playbook run.
+- name: "{{ final_ssot_vars.service.name }} | Read previously applied runtime flags"
+  ansible.builtin.slurp:
+    src: "{{ netbird_registration_marker }}"
+  register: netbird_applied_flags
+  failed_when: false
+  changed_when: false
+
+# --- 4c. Register (first time) OR reconcile (already registered) ----------------
+# Attributes are passed automatically from the SSoT: management URL, setup key
+# (ONLY on first registration), --hostname = the host's inventory name (the peer
+# name in the dashboard), plus the desired runtime flags.
+#
+# CRITICAL: `netbird up` on an ALREADY-CONNECTED peer just prints "Already
+# connected" and does NOTHING — it will not re-apply changed flags. To change
+# settings you must `down` first, then `up`. So we always disconnect (harmless
+# no-op / `|| true` when not connected) before (re)connecting. This only runs
+# when the flag set actually changed (or on first registration), so steady-state
+# converge runs don't churn the connection.
+- name: "{{ final_ssot_vars.service.name }} | Register/reconcile against {{ final_ssot_vars.vars.NB_MANAGEMENT_URL }}"
+  ansible.builtin.shell:
+    cmd: |
+      {{ netbird_binary }} down || true
+      {{ netbird_binary }} up \
+        --management-url {{ final_ssot_vars.vars.NB_MANAGEMENT_URL }} \
+        --hostname {{ inventory_hostname }} \
+        {{ ('--setup-key ' ~ final_ssot_vars.secrets.NB_SETUP_KEY) if not netbird_registered.stat.exists else '' }} \
+        {{ netbird_up_flags }}
+  when: >-
+    (not netbird_registered.stat.exists)
+    or ((netbird_applied_flags.content | default('') | b64decode | trim) != (netbird_up_flags | trim))
+  register: netbird_up
+  changed_when: true
+  no_log: true
+
+# --- 4d. Persist the applied flag set so future runs stay idempotent -----------
+- name: "{{ final_ssot_vars.service.name }} | Record applied runtime flags (= registration marker)"
+  ansible.builtin.copy:
+    content: "{{ netbird_up_flags | trim }}\n"
+    dest: "{{ netbird_registration_marker }}"
+    owner: root
+    group: root
+    mode: "0600"
+  when: netbird_up is changed

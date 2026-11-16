@@ -1,0 +1,72 @@
+service:
+  name: aac-netbird-agent
+  friendly_name: NetBird Agent
+  image_repo: netbirdio/netbird
+  image_tag: 0.74.2
+  description: NetBird client/agent — remote-access-only peer (no DNS/route takeover)
+  icon: https://cdn.jsdelivr.net/gh/walkxcode/dashboard-icons/png/netbird.png
+  category: Netzwerk & Sicherheit
+  stage: prod
+  hostname: netbird-agent
+config:
+  schema_version: 2
+  domain_name: example.com
+  generate_hostname: false
+  integrations:
+    homepage:
+      enabled: false
+    autodns:
+      enabled: false
+    traefik:
+      enabled: false
+vars:
+  TZ: Europe/Berlin
+  NB_MANAGEMENT_URL: https://netbird.example.com
+  NB_SKIP_UI_APP: 'true'
+  NB_USE_BIN_INSTALL: 'true'
+  NB_ENABLE_SSH: 'true'
+  NB_MANAGE_DNS: 'false'
+  NB_CLIENT_ROUTES: 'false'
+  NB_SERVER_ROUTES: 'false'
+secrets:
+  NB_SETUP_KEY: CHANGE_ME
+deployments:
+  docker_compose:
+    restart_policy: unless-stopped
+    host_base_path: /export/docker
+    cap_add:
+    - NET_ADMIN
+    volumes:
+    - nb_client:/var/lib/netbird
+    environment:
+      NB_SETUP_KEY: '{{ secrets.NB_SETUP_KEY }}'
+      NB_MANAGEMENT_URL: '{{ vars.NB_MANAGEMENT_URL }}'
+      TZ: '{{ vars.TZ }}'
+      NB_DISABLE_DNS: '{{ "false" if (vars.NB_MANAGE_DNS | lower) == "true" else "true"
+        }}'
+      NB_DISABLE_CLIENT_ROUTES: '{{ "false" if (vars.NB_CLIENT_ROUTES | lower) ==
+        "true" else "true" }}'
+      NB_DISABLE_SERVER_ROUTES: '{{ "false" if (vars.NB_SERVER_ROUTES | lower) ==
+        "true" else "true" }}'
+volumes:
+  nb_client:
+    description: NetBird client state (peer private key, config.json)
+deployment_strategy:
+  main:
+    enabled: true
+    target_stage: prod
+  dev:
+    enabled: true
+    target_stage: dev
+  test:
+    enabled: false
+    target_stage: test
+  ansible-dev:
+    enabled: true
+    target_stage: dev
+  iac-dev:
+    enabled: true
+    target_stage: dev
+  template-dev:
+    enabled: true
+    target_stage: dev
